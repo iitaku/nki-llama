@@ -1,4 +1,55 @@
-# NKI Llama
+# NKI Pure Implementation (nki-pure-impl branch)
+
+This branch contains a minimal, clean NKI implementation based on the upstream nki-llama repository.
+It includes only the essential files for NKI kernel integration without experimental scripts or documentation overhead.
+
+## Files Included
+
+- `llama_scratch.py`: Minimal LLaMA model implementation with NKI integration
+- `kernels/`: NKI kernel implementations (RMSNorm, Rotary Embedding, Attention, MLP)
+- `utils/scratch_helpers.py`: Helper functions
+- `tests/`: Integration tests for NKI kernels
+- `verify_equivalence.py`: Script to verify NKI vs PyTorch equivalence
+
+## Dependencies
+
+- AWS Neuron SDK (neuronxcc, torch-neuronx)
+- PyTorch
+- transformers (for tokenizer)
+
+## Quick Start
+
+1. **Activate Neuron environment:**
+   ```bash
+   source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+   ```
+
+2. **Run llama_scratch.py with NKI:**
+   ```bash
+   python llama_scratch.py --use-nki
+   ```
+
+3. **Run verification (NKI vs PyTorch equivalence):**
+   ```bash
+   python verify_equivalence.py
+   ```
+
+4. **Run tests:**
+   ```bash
+   pytest tests/
+   ```
+
+## Implementation Details
+
+- All NKI kernels have PyTorch fallback using try-except blocks
+- RMSNorm: `kernels/rms_norm.py` (rms_norm_nki)
+- Rotary Embedding: `kernels/rotary.py` (apply_rotary_single_nki)
+- Attention: `kernels/attention.py` (attention_kernel)
+- MLP (SwiGLU): `kernels/mlp.py` (mlp_swiglu_nki)
+
+---
+
+# NKI Llama (Original README)
 
 📢 Congratulations to the winning teams! Details about the contest track at ASPLOS are available on the blog post [here](https://www.sigarch.org/the-industry-contest-track-at-sigarch-conferences-the-asplos-2025-experience/). The code from the first place team is available [here](https://github.com/thustorage/nki-llama-contest). The second place team is [here](https://github.com/PASAUCMerced/nki-llama). The third place team is [here](https://github.com/corelab-src/nki-llama).
 
