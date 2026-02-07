@@ -49,7 +49,10 @@ from neuronxcc.nki._private_kernels.mlp import (
     quant_mlp_isa_kernel,
 )
 from neuronxcc.nki._private_kernels.rmsnorm import rmsnorm_quant_isa_kernel
-from neuronxcc.starfish.penguin.targets.nki.private_api import vnc
+try:
+    from neuronxcc.starfish.penguin.targets.nki.private_api import vnc
+except (ImportError, ModuleNotFoundError):
+    vnc = None
 from torch import nn, ones
 from torch_neuronx.xla_impl.ops import nki_jit
 from transformers import LlamaForCausalLM
