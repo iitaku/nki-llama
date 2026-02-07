@@ -2129,6 +2129,51 @@ class NeuronLlamaModel(NeuronBaseModel):
                 )
                 setattr(self, f"medusa_head_{i}", medusa_head)
 
+        # Patch lm_head to use NKI GEMM for context encoding (M > 1)
+        if getattr(config.neuron_config, 'nki_enabled', False):
+            self._patch_lm_head_nki()
+
+    def _patch_lm_head_nki(self):
+        """Replace lm_head matmul with NKI GEMM for M > 1 (context encoding).
+        For M = 1 (token generation), falls back to original ColumnParallelLinear."""
+        lm_head = self.lm_head
+        if not isinstance(lm_head, ColumnParallelLinear):
+            return
+
+        original_forward = lm_head.forward
+        _cache = {}
+
+        def nki_lm_head_forward(input, slice_indices=None):
+            M = input.reshape(-1, input.shape[-1]).shape[0]
+            if not NKI_ENABLED or M <= 1:
+                return original_forward(input, slice_indices)
+
+            if 'w_T' not in _cache:
+                _cache['w_T'] = lm_head.weight.permute(1, 0).contiguous()
+
+            w = _cache['w_T']
+            if slice_indices is not None:
+                w = lm_head.weight[slice_indices, :].permute(1, 0).contiguous()
+
+            original_shape = input.shape
+            x_2d = input.reshape(-1, input.shape[-1])
+            x_T = x_2d.permute(1, 0).contiguous()
+
+            if M <= 128:
+                output_parallel = nki_thin_gemm(x_T, w)
+            else:
+                output_parallel = nki_blocked_gemm(x_T, w)
+
+            output_parallel = output_parallel.reshape(
+                original_shape[:-1] + (output_parallel.shape[-1],))
+
+            # Gather output across TP ranks (same as ColumnParallelLinear)
+            output = lm_head._cpl_maybe_gather_output(output_parallel)
+
+            return output
+
+        lm_head.forward = nki_lm_head_forward
+
 
 class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
     """
