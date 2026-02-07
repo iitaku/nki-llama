@@ -164,20 +164,11 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
 
 # ============================================================
 # NKI Thin GEMM Kernel (M <= 128, for token generation)
+# Uses nisa.nc_matmul for direct tensor engine control
 # Computes: result = lhsT.T @ rhs  where lhsT is [K, M], rhs is [K, N]
-# Output: result [M, N]
 # ============================================================
 @nki.jit
 def nki_thin_gemm(lhsT, rhs):
-    """Optimized GEMM for small M (M <= 128, single partition tile).
-
-    Args:
-        lhsT: Transposed LHS matrix [K, M] where M <= 128
-        rhs: RHS matrix [K, N]
-
-    Returns:
-        result: [M, N] = lhsT.T @ rhs
-    """
     K, M = lhsT.shape
     K2, N = rhs.shape
     assert K == K2, f"K mismatch: {K} vs {K2}"
@@ -185,43 +176,35 @@ def nki_thin_gemm(lhsT, rhs):
 
     result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
-    # Determine tile size for N dimension
-    TILE_N_LOCAL = min(N, 512)
-    n_tiles = cdiv(N, TILE_N_LOCAL)
+    TILE_N = min(N, 512)
+    n_tiles = cdiv(N, TILE_N)
     k_tiles = cdiv(K, 128)
 
     i_m = nl.arange(M)[:, None]
+    i_m_free = nl.arange(M)[None, :]
 
     for n_t in nl.affine_range(n_tiles):
-        n_start = n_t * TILE_N_LOCAL
-        i_n = nl.arange(TILE_N_LOCAL)[None, :]
+        n_start = n_t * TILE_N
+        i_n = nl.arange(TILE_N)[None, :]
 
-        # Accumulate in PSUM
-        res_psum = nl.zeros((M, TILE_N_LOCAL), dtype=nl.float32, buffer=nl.psum)
+        res_psum = nl.zeros((M, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
         for k_t in nl.affine_range(k_tiles):
             k_start = k_t * 128
             i_k = nl.arange(128)[:, None]
-            i_k_free_n = nl.arange(TILE_N_LOCAL)[None, :]
 
-            # Load lhsT tile [128, M] - partition dim is K, free dim is M
-            i_m_free = nl.arange(M)[None, :]
             lhs_tile = nl.load(
                 lhsT[k_start + i_k, i_m_free],
                 mask=(k_start + i_k < K)
             )
-
-            # Load rhs tile [128, TILE_N] - partition dim is K, free dim is N
             rhs_tile = nl.load(
-                rhs[k_start + i_k, n_start + i_k_free_n],
-                mask=((k_start + i_k < K) & (n_start + i_k_free_n < N))
+                rhs[k_start + i_k, n_start + i_n],
+                mask=((k_start + i_k < K) & (n_start + i_n < N))
             )
 
-            # matmul: lhs_tile.T @ rhs_tile = [M, TILE_N]
-            # lhs_tile is [128, M] (stationary), rhs_tile is [128, TILE_N] (moving)
-            res_psum += nl.matmul(lhs_tile, rhs_tile, transpose_x=True)
+            # ISA matmul: stationary^T @ moving, accumulates in psum
+            nisa.nc_matmul(res_psum, lhs_tile, rhs_tile)
 
-        # Store result
         res_sbuf = nl.copy(res_psum, dtype=lhsT.dtype)
         nl.store(
             result[i_m, n_start + i_n],
@@ -234,19 +217,10 @@ def nki_thin_gemm(lhsT, rhs):
 
 # ============================================================
 # NKI Blocked GEMM Kernel (for larger M, context encoding)
-# Computes: result = lhsT.T @ rhs  where lhsT is [K, M], rhs is [K, N]
+# Uses nisa.nc_matmul for direct tensor engine control
 # ============================================================
 @nki.jit
 def nki_blocked_gemm(lhsT, rhs):
-    """Block-tiled GEMM for larger M dimensions.
-
-    Args:
-        lhsT: Transposed LHS [K, M]
-        rhs: RHS matrix [K, N]
-
-    Returns:
-        result: [M, N] = lhsT.T @ rhs
-    """
     K, M = lhsT.shape
     K2, N = rhs.shape
     assert K == K2
@@ -270,29 +244,175 @@ def nki_blocked_gemm(lhsT, rhs):
             for k_t in nl.affine_range(k_tiles):
                 k_start = k_t * 128
                 i_k = nl.arange(128)[:, None]
-                i_lhs_free = nl.arange(128)[None, :]
-                i_rhs_free = nl.arange(512)[None, :]
 
-                # Load tiles
                 lhs_tile = nl.load(
-                    lhsT[k_start + i_k, m_start + i_lhs_free],
-                    mask=((k_start + i_k < K) & (m_start + i_lhs_free < M))
+                    lhsT[k_start + i_k, m_start + nl.arange(128)[None, :]],
+                    mask=((k_start + i_k < K) & (m_start + nl.arange(128)[None, :] < M))
                 )
                 rhs_tile = nl.load(
-                    rhs[k_start + i_k, n_start + i_rhs_free],
-                    mask=((k_start + i_k < K) & (n_start + i_rhs_free < N))
+                    rhs[k_start + i_k, n_start + i_n],
+                    mask=((k_start + i_k < K) & (n_start + i_n < N))
                 )
 
-                # Accumulate: lhs_tile.T @ rhs_tile
-                res_psum += nl.matmul(lhs_tile, rhs_tile, transpose_x=True)
+                nisa.nc_matmul(res_psum, lhs_tile, rhs_tile)
 
-            # Store with masking
             res_sbuf = nl.copy(res_psum, dtype=lhsT.dtype)
             nl.store(
                 result[m_start + i_m, n_start + i_n],
                 value=res_sbuf,
                 mask=((m_start + i_m < M) & (n_start + i_n < N))
             )
+
+    return result
+
+
+# ============================================================
+# Fused Gate+Up GEMM (single kernel for both projections)
+# Shares activation loading, reduces dispatch overhead
+# ============================================================
+@nki.jit
+def nki_fused_gate_up_gemm(lhsT, gate_rhs, up_rhs):
+    """Fused gate+up projection: lhsT.T @ gate_rhs and lhsT.T @ up_rhs.
+
+    Args:
+        lhsT: [K, M] where M <= 128
+        gate_rhs: [K, N]
+        up_rhs: [K, N]
+
+    Returns:
+        gate_out: [M, N], up_out: [M, N]
+    """
+    K, M = lhsT.shape
+    _, N = gate_rhs.shape
+
+    gate_out = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+    up_out = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+
+    TILE_N = min(N, 512)
+    n_tiles = cdiv(N, TILE_N)
+    k_tiles = cdiv(K, 128)
+
+    i_m = nl.arange(M)[:, None]
+    i_m_free = nl.arange(M)[None, :]
+
+    for n_t in nl.affine_range(n_tiles):
+        n_start = n_t * TILE_N
+        i_n = nl.arange(TILE_N)[None, :]
+
+        gate_psum = nl.zeros((M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+        up_psum = nl.zeros((M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+
+        for k_t in nl.affine_range(k_tiles):
+            k_start = k_t * 128
+            i_k = nl.arange(128)[:, None]
+
+            # Load activation ONCE for both projections
+            lhs_tile = nl.load(
+                lhsT[k_start + i_k, i_m_free],
+                mask=(k_start + i_k < K)
+            )
+
+            gate_tile = nl.load(
+                gate_rhs[k_start + i_k, n_start + i_n],
+                mask=((k_start + i_k < K) & (n_start + i_n < N))
+            )
+            up_tile = nl.load(
+                up_rhs[k_start + i_k, n_start + i_n],
+                mask=((k_start + i_k < K) & (n_start + i_n < N))
+            )
+
+            # Two matmuls sharing same stationary (activation) tile
+            nisa.nc_matmul(gate_psum, lhs_tile, gate_tile)
+            nisa.nc_matmul(up_psum, lhs_tile, up_tile)
+
+        gate_sbuf = nl.copy(gate_psum, dtype=lhsT.dtype)
+        up_sbuf = nl.copy(up_psum, dtype=lhsT.dtype)
+        nl.store(gate_out[i_m, n_start + i_n], value=gate_sbuf,
+                 mask=(n_start + i_n < N))
+        nl.store(up_out[i_m, n_start + i_n], value=up_sbuf,
+                 mask=(n_start + i_n < N))
+
+    return gate_out, up_out
+
+
+# ============================================================
+# Fused SwiGLU + Down Projection (eliminates HBM round-trip)
+# Computes: output = (silu(gate) * up) @ down_w.T
+# ============================================================
+@nki.jit
+def nki_fused_swiglu_down(gate_T, up_T, down_rhs):
+    """Fused SwiGLU activation + down projection.
+
+    Computes SiLU(gate) * up in SBUF, then matmul with down weights.
+    Eliminates HBM round-trip for intermediate SwiGLU result.
+
+    Args:
+        gate_T: [N, M] transposed gate projection output
+        up_T: [N, M] transposed up projection output
+        down_rhs: [N, K_out] transposed down projection weight
+
+    Returns:
+        result: [M, K_out]
+    """
+    N, M = gate_T.shape
+    N2, K_out = down_rhs.shape
+    assert N == N2
+
+    result = nl.ndarray((M, K_out), dtype=gate_T.dtype, buffer=nl.shared_hbm)
+
+    TILE_K = min(K_out, 512)
+    k_tiles = cdiv(K_out, TILE_K)
+    n_tiles = cdiv(N, 128)
+
+    i_m = nl.arange(M)[:, None]
+    i_m_free = nl.arange(M)[None, :]
+
+    for k_t in nl.affine_range(k_tiles):
+        k_start = k_t * TILE_K
+        i_k = nl.arange(TILE_K)[None, :]
+
+        res_psum = nl.zeros((M, TILE_K), dtype=nl.float32, buffer=nl.psum)
+
+        for n_t in nl.affine_range(n_tiles):
+            n_start = n_t * 128
+            i_n = nl.arange(128)[:, None]
+
+            # Load gate and up tiles
+            gate_tile = nl.load(
+                gate_T[n_start + i_n, i_m_free],
+                mask=(n_start + i_n < N)
+            )
+            up_tile = nl.load(
+                up_T[n_start + i_n, i_m_free],
+                mask=(n_start + i_n < N)
+            )
+
+            # Compute SwiGLU in SBUF: silu(gate) * up
+            # SiLU(x) = x * sigmoid(x) = x * exp(x) / (1 + exp(x))
+            gate_f32 = nl.copy(gate_tile, dtype=nl.float32)
+            exp_gate = nl.exp(gate_f32)
+            sigmoid_gate = nl.divide(exp_gate, exp_gate + 1.0)
+            silu_gate = nl.multiply(gate_f32, sigmoid_gate)
+
+            up_f32 = nl.copy(up_tile, dtype=nl.float32)
+            swiglu_f32 = nl.multiply(silu_gate, up_f32)
+            swiglu_tile = nl.copy(swiglu_f32, dtype=gate_T.dtype)
+
+            # Load down weight tile
+            down_tile = nl.load(
+                down_rhs[n_start + i_n, k_start + i_k],
+                mask=((n_start + i_n < N) & (k_start + i_k < K_out))
+            )
+
+            # ISA matmul: swiglu^T @ down = [M, TILE_K]
+            nisa.nc_matmul(res_psum, swiglu_tile, down_tile)
+
+        res_sbuf = nl.copy(res_psum, dtype=gate_T.dtype)
+        nl.store(
+            result[i_m, k_start + i_k],
+            value=res_sbuf,
+            mask=(k_start + i_k < K_out)
+        )
 
     return result
 
@@ -1226,9 +1346,16 @@ class NeuronLlamaMLP(nn.Module):
         logger.debug(f"MLP output shape {output.shape}")
         return output
 
+    def _ensure_transposed_weights(self):
+        """Cache transposed weights on first call to avoid per-forward-call transposes."""
+        if not hasattr(self, '_gate_w_T'):
+            self._gate_w_T = self.gate_proj.weight.permute(1, 0).contiguous()
+            self._up_w_T = self.up_proj.weight.permute(1, 0).contiguous()
+            self._down_w_T = self.down_proj.weight.permute(1, 0).contiguous()
+
     def _nki_mlp(self, x, rmsnorm, adapter_ids=None):
-        """NKI-powered MLP: uses pure NKI GEMM kernels for all projections."""
-        logger.debug("MLP: NKI GEMM kernels")
+        """NKI-powered MLP with fused ISA kernels for maximum throughput."""
+        logger.debug("MLP: NKI fused ISA kernels")
         if self.sequence_parallel_enabled:
             x = gather_from_sequence_parallel_region(
                 x, self.sequence_dimension, process_group=get_tp_group(self.config)
@@ -1239,38 +1366,27 @@ class NeuronLlamaMLP(nn.Module):
         x_2d = x.reshape(-1, K)  # [M, K]
         M = x_2d.shape[0]
 
-        # Get weight tensors (already sharded by TP)
-        # gate_proj.weight: [inter/tp, K], up_proj.weight: [inter/tp, K]
-        # down_proj.weight: [K, inter/tp]
-        gate_w = self.gate_proj.weight  # [N, K]
-        up_w = self.up_proj.weight      # [N, K]
-        down_w = self.down_proj.weight  # [K_out, N]
+        # Use cached transposed weights (computed once, reused every token)
+        self._ensure_transposed_weights()
+        gate_w_T = self._gate_w_T  # [K, inter/tp]
+        up_w_T = self._up_w_T      # [K, inter/tp]
+        down_w_T = self._down_w_T  # [inter/tp, K_out]
 
-        # NKI GEMM: nki_thin_gemm(lhsT, rhs) = lhsT.T @ rhs
-        # For F.linear(x, w) = x @ w.T:
-        #   lhsT = x.T [K, M], rhs = w.T [K, N]
-        #   result = x.T.T @ w.T = x @ w.T = [M, N] ✓
         x_T = x_2d.permute(1, 0).contiguous()  # [K, M]
-        gate_w_T = gate_w.permute(1, 0).contiguous()  # [K, inter/tp]
-        up_w_T = up_w.permute(1, 0).contiguous()      # [K, inter/tp]
 
         if M <= 128:
-            gate_out = nki_thin_gemm(x_T, gate_w_T)
-            up_out = nki_thin_gemm(x_T, up_w_T)
+            # Fused gate+up: single kernel, shares activation loading
+            gate_out, up_out = nki_fused_gate_up_gemm(x_T, gate_w_T, up_w_T)
+
+            # Fused SwiGLU + Down: eliminates HBM round-trip for SwiGLU result
+            gate_out_T = gate_out.permute(1, 0).contiguous()  # [N, M]
+            up_out_T = up_out.permute(1, 0).contiguous()      # [N, M]
+            output = nki_fused_swiglu_down(gate_out_T, up_out_T, down_w_T)
         else:
             gate_out = nki_blocked_gemm(x_T, gate_w_T)
             up_out = nki_blocked_gemm(x_T, up_w_T)
-
-        # SwiGLU: silu(gate) * up
-        down_proj_input = self.act_fn(gate_out) * up_out  # [M, inter/tp]
-
-        # Down projection: swiglu @ down_w.T = [M, K_out]
-        swiglu_T = down_proj_input.permute(1, 0).contiguous()  # [inter/tp, M]
-        down_w_T = down_w.permute(1, 0).contiguous()  # [inter/tp, K_out]
-
-        if M <= 128:
-            output = nki_thin_gemm(swiglu_T, down_w_T)
-        else:
+            down_proj_input = self.act_fn(gate_out) * up_out
+            swiglu_T = down_proj_input.permute(1, 0).contiguous()
             output = nki_blocked_gemm(swiglu_T, down_w_T)
 
         output = output.reshape(original_shape[:-1] + (output.shape[-1],))
