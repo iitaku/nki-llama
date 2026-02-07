@@ -1634,7 +1634,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+        attn_output = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1643,6 +1643,10 @@ class NeuronLlamaDecoderLayer(nn.Module):
             rmsnorm=self.input_layernorm,
             **kwargs,
         )
+        hidden_states = attn_output[0]
+        present_key_value = attn_output[1]
+        cos_cache = attn_output[2]
+        sin_cache = attn_output[3]
 
         if self.mlp_kernel_enabled and self.mlp_kernel_fuse_residual_add:
             assert (
@@ -1668,8 +1672,9 @@ class NeuronLlamaDecoderLayer(nn.Module):
             )
 
         hidden_states = residual + hidden_states
+        residual = None
 
-        outputs = (hidden_states, present_key_value, cos_cache, sin_cache)
+        outputs = (hidden_states, present_key_value, cos_cache, sin_cache, residual)
         return outputs
 
 
