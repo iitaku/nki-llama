@@ -852,7 +852,8 @@ class CustomRMSNorm(nn.Module):
         self.nki_enabled = nki_enabled
 
     def forward(self, hidden_states):
-        if self.nki_enabled:
+        if self.nki_enabled and hidden_states.shape[1] > 1:
+            # Use NKI RMSNorm for context encoding (S>1), compiler for token gen (S=1)
             out_tensor = nki_rmsnorm_kernel(hidden_states, self.weight, self.variance_epsilon)
             return out_tensor
 
