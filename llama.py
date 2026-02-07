@@ -1408,10 +1408,6 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         Returns:
             (attn_output, FlashAttentionStrategy)
         """
-        # TODO: Re-enable NKI flash attention after fixing precision
-        # For now, always use base class attention for accuracy
-        return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
-
         if not NKI_ENABLED:
             return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
 
