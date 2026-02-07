@@ -1450,6 +1450,12 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         Returns:
             attn_output: [B, H_q, 1, D] (BHSD)
         """
+        # TODO: NKI flash decode has precision issues, use base class for now
+        return super().compute_for_token_gen(
+            Q, K, V, position_ids, past_key_value,
+            attention_mask, active_mask, is_prefix_caching
+        )
+
         # Fall back for complex cases
         if not NKI_ENABLED or is_prefix_caching:
             return super().compute_for_token_gen(

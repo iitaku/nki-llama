@@ -495,9 +495,12 @@ def count_nki_flop_ratio(
 
     # Auto-detect HLO file paths if defaults don't exist
     if not os.path.exists(hlo_path_context_enc):
-        hlo_path_context_enc = _find_hlo_file(os.path.dirname(hlo_path_context_enc))
+        # New SDK puts HLO in _tp0_bk0/ not _tp0_bk0/model/
+        base_dir = os.path.dirname(os.path.dirname(hlo_path_context_enc))
+        hlo_path_context_enc = _find_hlo_file(base_dir)
     if not os.path.exists(hlo_path_token_gen):
-        hlo_path_token_gen = _find_hlo_file(os.path.dirname(hlo_path_token_gen))
+        base_dir = os.path.dirname(os.path.dirname(hlo_path_token_gen))
+        hlo_path_token_gen = _find_hlo_file(base_dir)
 
     hlo_proto_context_enc = parse_hlo_file(hlo_path_context_enc)
     hlo_proto_token_gen = parse_hlo_file(hlo_path_token_gen)
