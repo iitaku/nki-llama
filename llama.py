@@ -61,13 +61,14 @@ from neuronx_distributed_inference.models.model_base import (  # noqa: E402
     NeuronBaseForCausalLM,
     NeuronBaseModel,
 )
-from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase, FlashAttentionStrategy
 from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402
     BaseGroupQueryAttention,
 )
 from neuronx_distributed_inference.modules.attention.utils import (
     RotaryEmbedding,
     preprocess_quantized_linear_layer,
+    repeat_kv,
     transpose_parallel_linear_layer,
 )
 
@@ -1395,6 +1396,124 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 # Warning: The HF implementation may have precision issues when run on Neuron.
                 # We include it here for compatibility with other scaling types.
                 self.rotary_emb = LlamaRotaryEmbedding(self.config)
+
+    def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask):
+        """Override to use NKI flash attention kernel for context encoding.
+
+        Args:
+            Q: [B, H_q, S, D] (BHSD)
+            K: [B, H_kv, S, D] (BHSD)
+            V: [B, H_kv, S, D] (BHSD)
+            q_len: sequence length
+            bsz: batch size
+            attention_mask: causal mask or None
+
+        Returns:
+            (attn_output, FlashAttentionStrategy)
+        """
+        if not NKI_ENABLED:
+            return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
+
+        logger.info("NKI Flash Attention: perform_prefill")
+
+        # GQA: repeat K,V to match Q heads
+        K_active = repeat_kv(K, self.num_key_value_groups)
+        V_active = repeat_kv(V, self.num_key_value_groups)
+
+        # Convert BHSD -> BHDS for Q and K (kernel expects Q,K as [B, H, D, S])
+        Q_t = Q.permute(0, 1, 3, 2).contiguous()
+        K_t = K_active.permute(0, 1, 3, 2).contiguous()
+        # V stays as BHSD (kernel expects V as [B, H, S, D])
+        V_c = V_active.contiguous()
+
+        # attention_mask is not None => causal model
+        use_causal = attention_mask is not None
+
+        # Call NKI flash attention forward kernel
+        attn_output = flash_attention_fwd(Q_t, K_t, V_c, use_causal_mask=use_causal)
+        # Output: [B, H, S, D] = BHSD
+
+        # Return NONE strategy so caller transposes BHSD -> BSHD
+        return attn_output, FlashAttentionStrategy.NONE
+
+    def compute_for_token_gen(self, Q, K, V, position_ids, past_key_value,
+                              attention_mask, active_mask, is_prefix_caching=False):
+        """Override to use NKI flash decode kernel for single-token generation.
+
+        Args:
+            Q: [B, H_q, 1, D] query for current token
+            K: [B, H_kv, 1, D] key for current token
+            V: [B, H_kv, 1, D] value for current token
+            position_ids: position IDs
+            past_key_value: (K_cache, V_cache) tuple
+            attention_mask: [B, H, 1, cache_len] boolean mask for cached KV
+            active_mask: mask for active tokens (used in speculation)
+            is_prefix_caching: whether prefix caching is enabled
+
+        Returns:
+            attn_output: [B, H_q, 1, D] (BHSD)
+        """
+        # Fall back for complex cases
+        if not NKI_ENABLED or is_prefix_caching:
+            return super().compute_for_token_gen(
+                Q, K, V, position_ids, past_key_value,
+                attention_mask, active_mask, is_prefix_caching
+            )
+
+        is_speculation = False if position_ids is None else position_ids.shape[-1] > 1
+        if is_speculation:
+            return super().compute_for_token_gen(
+                Q, K, V, position_ids, past_key_value,
+                attention_mask, active_mask, is_prefix_caching
+            )
+
+        logger.info("NKI Flash Decode: compute_for_token_gen")
+
+        # Get cached KV
+        K_prior = past_key_value[0]
+        V_prior = past_key_value[1]
+
+        # Handle transposed K cache
+        if self.k_cache_transposed:
+            K_prior = K_prior.transpose(2, 3)  # BHDS -> BHSD
+
+        # GQA expansion
+        K_prior_exp = repeat_kv(K_prior, self.num_key_value_groups)
+        V_prior_exp = repeat_kv(V_prior, self.num_key_value_groups)
+        K_active = repeat_kv(K, self.num_key_value_groups)
+        V_active = repeat_kv(V, self.num_key_value_groups)
+
+        # Concatenate prior + active KV along sequence dimension
+        K_full = torch.cat([K_prior_exp, K_active], dim=2)  # [B, H, kv_len, D]
+        V_full = torch.cat([V_prior_exp, V_active], dim=2)  # [B, H, kv_len, D]
+
+        # Prepare K for kernel: BHSD -> BHDS
+        K_full_t = K_full.permute(0, 1, 3, 2).contiguous()  # [B, H, D, kv_len]
+        V_full_c = V_full.contiguous()
+
+        # Build mask [B, 1, 1, kv_len]
+        cache_len = K_prior_exp.shape[2]
+        prior_mask = attention_mask[:, 0:1, :, :].float()  # [B, 1, 1, mask_len]
+        # Pad or trim mask to match cache_len
+        if prior_mask.shape[-1] < cache_len:
+            prior_mask = torch.nn.functional.pad(
+                prior_mask, (0, cache_len - prior_mask.shape[-1]), value=0.0
+            )
+        elif prior_mask.shape[-1] > cache_len:
+            prior_mask = prior_mask[:, :, :, :cache_len]
+
+        # Active tokens always attended (no speculation/prefix_caching here)
+        active_ones = torch.ones(
+            Q.shape[0], 1, 1, K_active.shape[2],
+            device=Q.device, dtype=torch.float32
+        )
+        full_mask = torch.cat([prior_mask, active_ones], dim=-1)  # [B, 1, 1, kv_len]
+
+        # Call NKI flash decode kernel
+        attn_output = flash_decode_kernel(Q, K_full_t, V_full_c, full_mask)
+        # Output: [B, H, 1, D] = BHSD
+
+        return attn_output
 
 
 # TODO: Modularize RotaryEmbedding. See how HF transformers does it in 4.43.
