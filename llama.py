@@ -333,6 +333,86 @@ def nki_fused_gate_up_gemm(lhsT, gate_rhs, up_rhs):
 
 
 # ============================================================
+# Fused QKV Projection with Separate Weights
+# Shares activation loading for K+V, reduces kernel dispatch count
+# ============================================================
+@nki.jit
+def nki_fused_qkv_separate_gemm(lhsT, q_rhs, k_rhs, v_rhs):
+    """Fused Q+K+V projection with separate weight matrices.
+
+    Computes all three projections in one kernel call.
+    K and V share activation tile loading.
+
+    Args:
+        lhsT: [K, M] where M <= 128
+        q_rhs: [K, Nq]
+        k_rhs: [K, Nkv]
+        v_rhs: [K, Nkv]
+
+    Returns:
+        Q_out: [M, Nq], K_out: [M, Nkv], V_out: [M, Nkv]
+    """
+    K, M = lhsT.shape
+    _, Nq = q_rhs.shape
+    _, Nkv = k_rhs.shape
+
+    Q_out = nl.ndarray((M, Nq), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+    K_out = nl.ndarray((M, Nkv), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+    V_out = nl.ndarray((M, Nkv), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+
+    k_tiles = cdiv(K, 128)
+    TILE_Nq = min(Nq, 512)
+    TILE_Nkv = min(Nkv, 512)
+    q_n_tiles = cdiv(Nq, TILE_Nq)
+    kv_n_tiles = cdiv(Nkv, TILE_Nkv)
+
+    i_m = nl.arange(M)[:, None]
+    i_m_free = nl.arange(M)[None, :]
+
+    # Q projection
+    for n_t in nl.affine_range(q_n_tiles):
+        n_start = n_t * TILE_Nq
+        i_n = nl.arange(TILE_Nq)[None, :]
+        q_psum = nl.zeros((M, TILE_Nq), dtype=nl.float32, buffer=nl.psum)
+
+        for k_t in nl.affine_range(k_tiles):
+            k_start = k_t * 128
+            i_k = nl.arange(128)[:, None]
+            lhs_tile = nl.load(lhsT[k_start + i_k, i_m_free], mask=(k_start + i_k < K))
+            q_tile = nl.load(q_rhs[k_start + i_k, n_start + i_n],
+                           mask=((k_start + i_k < K) & (n_start + i_n < Nq)))
+            q_psum += nisa.nc_matmul(lhs_tile, q_tile)
+
+        q_sbuf = nl.copy(q_psum, dtype=lhsT.dtype)
+        nl.store(Q_out[i_m, n_start + i_n], value=q_sbuf, mask=(n_start + i_n < Nq))
+
+    # K+V fused projection (shared activation loading)
+    for n_t in nl.affine_range(kv_n_tiles):
+        n_start = n_t * TILE_Nkv
+        i_n_kv = nl.arange(TILE_Nkv)[None, :]
+        k_psum = nl.zeros((M, TILE_Nkv), dtype=nl.float32, buffer=nl.psum)
+        v_psum = nl.zeros((M, TILE_Nkv), dtype=nl.float32, buffer=nl.psum)
+
+        for k_t in nl.affine_range(k_tiles):
+            k_start = k_t * 128
+            i_k = nl.arange(128)[:, None]
+            lhs_tile = nl.load(lhsT[k_start + i_k, i_m_free], mask=(k_start + i_k < K))
+            k_w_tile = nl.load(k_rhs[k_start + i_k, n_start + i_n_kv],
+                              mask=((k_start + i_k < K) & (n_start + i_n_kv < Nkv)))
+            v_w_tile = nl.load(v_rhs[k_start + i_k, n_start + i_n_kv],
+                              mask=((k_start + i_k < K) & (n_start + i_n_kv < Nkv)))
+            k_psum += nisa.nc_matmul(lhs_tile, k_w_tile)
+            v_psum += nisa.nc_matmul(lhs_tile, v_w_tile)
+
+        k_sbuf = nl.copy(k_psum, dtype=lhsT.dtype)
+        v_sbuf = nl.copy(v_psum, dtype=lhsT.dtype)
+        nl.store(K_out[i_m, n_start + i_n_kv], value=k_sbuf, mask=(n_start + i_n_kv < Nkv))
+        nl.store(V_out[i_m, n_start + i_n_kv], value=v_sbuf, mask=(n_start + i_n_kv < Nkv))
+
+    return Q_out, K_out, V_out
+
+
+# ============================================================
 # Fused SwiGLU + Down Projection (eliminates HBM round-trip)
 # Computes: output = (silu(gate) * up) @ down_w.T
 # ============================================================
@@ -1516,7 +1596,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
 
             qkv._native_qkv_forward = nki_fused_qkv_forward
         else:
-            # Separate Q, K, V projections
+            # Separate Q, K, V projections - use fused kernel for M <= 128
             original_native = qkv._native_qkv_forward
             _cache = {}
 
@@ -1536,9 +1616,9 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 x_T = x_2d.permute(1, 0).contiguous()
 
                 if M <= 128:
-                    Q = nki_thin_gemm(x_T, _cache['q_wT'])
-                    K_out = nki_thin_gemm(x_T, _cache['k_wT'])
-                    V_out = nki_thin_gemm(x_T, _cache['v_wT'])
+                    # Fused QKV: single kernel dispatch instead of 3
+                    Q, K_out, V_out = nki_fused_qkv_separate_gemm(
+                        x_T, _cache['q_wT'], _cache['k_wT'], _cache['v_wT'])
                 else:
                     Q = nki_blocked_gemm(x_T, _cache['q_wT'])
                     K_out = nki_blocked_gemm(x_T, _cache['k_wT'])
