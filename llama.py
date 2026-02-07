@@ -164,7 +164,6 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
 
 # ============================================================
 # NKI Thin GEMM Kernel (M <= 128, for token generation)
-# Uses nisa.nc_matmul for direct tensor engine control
 # Computes: result = lhsT.T @ rhs  where lhsT is [K, M], rhs is [K, N]
 # ============================================================
 @nki.jit
@@ -202,8 +201,7 @@ def nki_thin_gemm(lhsT, rhs):
                 mask=((k_start + i_k < K) & (n_start + i_n < N))
             )
 
-            # ISA matmul: stationary^T @ moving, accumulates in psum
-            res_psum += nisa.nc_matmul(lhs_tile, rhs_tile)
+            res_psum += nl.matmul(lhs_tile, rhs_tile, transpose_x=True)
 
         res_sbuf = nl.copy(res_psum, dtype=lhsT.dtype)
         nl.store(
@@ -217,7 +215,6 @@ def nki_thin_gemm(lhsT, rhs):
 
 # ============================================================
 # NKI Blocked GEMM Kernel (for larger M, context encoding)
-# Uses nisa.nc_matmul for direct tensor engine control
 # ============================================================
 @nki.jit
 def nki_blocked_gemm(lhsT, rhs):
@@ -254,7 +251,7 @@ def nki_blocked_gemm(lhsT, rhs):
                     mask=((k_start + i_k < K) & (n_start + i_n < N))
                 )
 
-                res_psum += nisa.nc_matmul(lhs_tile, rhs_tile)
+                res_psum += nl.matmul(lhs_tile, rhs_tile, transpose_x=True)
 
             res_sbuf = nl.copy(res_psum, dtype=lhsT.dtype)
             nl.store(
@@ -1354,8 +1351,8 @@ class NeuronLlamaMLP(nn.Module):
             self._down_w_T = self.down_proj.weight.permute(1, 0).contiguous()
 
     def _nki_mlp(self, x, rmsnorm, adapter_ids=None):
-        """NKI-powered MLP with fused ISA kernels for maximum throughput."""
-        logger.debug("MLP: NKI fused ISA kernels")
+        """NKI-powered MLP: uses ISA GEMM kernels for all projections."""
+        logger.debug("MLP: NKI ISA GEMM kernels")
         if self.sequence_parallel_enabled:
             x = gather_from_sequence_parallel_region(
                 x, self.sequence_dimension, process_group=get_tp_group(self.config)
@@ -1375,18 +1372,18 @@ class NeuronLlamaMLP(nn.Module):
         x_T = x_2d.permute(1, 0).contiguous()  # [K, M]
 
         if M <= 128:
-            # Fused gate+up: single kernel, shares activation loading
-            gate_out, up_out = nki_fused_gate_up_gemm(x_T, gate_w_T, up_w_T)
-
-            # Fused SwiGLU + Down: eliminates HBM round-trip for SwiGLU result
-            gate_out_T = gate_out.permute(1, 0).contiguous()  # [N, M]
-            up_out_T = up_out.permute(1, 0).contiguous()      # [N, M]
-            output = nki_fused_swiglu_down(gate_out_T, up_out_T, down_w_T)
+            gate_out = nki_thin_gemm(x_T, gate_w_T)
+            up_out = nki_thin_gemm(x_T, up_w_T)
         else:
             gate_out = nki_blocked_gemm(x_T, gate_w_T)
             up_out = nki_blocked_gemm(x_T, up_w_T)
-            down_proj_input = self.act_fn(gate_out) * up_out
-            swiglu_T = down_proj_input.permute(1, 0).contiguous()
+
+        down_proj_input = self.act_fn(gate_out) * up_out
+
+        swiglu_T = down_proj_input.permute(1, 0).contiguous()
+        if M <= 128:
+            output = nki_thin_gemm(swiglu_T, down_w_T)
+        else:
             output = nki_blocked_gemm(swiglu_T, down_w_T)
 
         output = output.reshape(original_shape[:-1] + (output.shape[-1],))
@@ -1422,7 +1419,11 @@ class NeuronLlamaMLP(nn.Module):
                 x, fused_rmsnorm, rmsnorm, residual, adapter_ids=adapter_ids
             )
         elif NKI_ENABLED:
-            # Pure NKI GEMM path
+            # Use compiler matmul for M=1 (token gen) - faster than NKI for tiny M
+            # NKI GEMM for M>1 (context encoding) - more NKI FLOPs
+            M = x.reshape(-1, x.shape[-1]).shape[0]
+            if M <= 1:
+                return (self._native_mlp(x, rmsnorm, adapter_ids=adapter_ids), None)
             return (self._nki_mlp(x, rmsnorm, adapter_ids=adapter_ids), None)
         else:
             # No kernel
