@@ -1325,25 +1325,31 @@ class NeuronLlamaAttention(NeuronAttentionBase):
     """
 
     def __init__(self, config: InferenceConfig, tensor_model_parallel_group=None):
-        super().__init__(tensor_model_parallel_group=tensor_model_parallel_group)
+        super().__init__(
+            config=config,
+            tensor_model_parallel_group=tensor_model_parallel_group,
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            head_dim=getattr(config, "head_dim", config.hidden_size // config.num_attention_heads),
+            rotary_emb=self.get_rope(config=config),
+            num_cores_per_group=config.num_cores_per_group,
+            qkv_bias=getattr(config, "attention_bias", False),
+            o_bias=getattr(config, "attention_bias", False),
+            rms_norm_eps=config.rms_norm_eps,
+            attention_chunk_size=getattr(config, "attention_chunk_size", None),
+            sliding_window=getattr(config, "sliding_window", None),
+        )
 
-        self.config = config
-        self.neuron_config = config.neuron_config
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.head_dim = self.hidden_size // self.num_attention_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.padding_side = config.neuron_config.padding_side
         self.torch_dtype = config.neuron_config.torch_dtype
         self.is_medusa = config.neuron_config.is_medusa
         self.flash_decoding_enabled = config.neuron_config.flash_decoding_enabled
-        self.num_cores_per_group = config.num_cores_per_group
         self.bias = getattr(config, "attention_bias", False)
         self.rpl_reduce_dtype = config.neuron_config.rpl_reduce_dtype
         self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
-        self.rms_norm_eps = config.rms_norm_eps
 
         if parallel_state.model_parallel_is_initialized():
             self.tp_degree = self.config.neuron_config.tp_degree
@@ -1351,7 +1357,6 @@ class NeuronLlamaAttention(NeuronAttentionBase):
             self.tp_degree = 1
 
         self.fused_qkv = config.neuron_config.fused_qkv
-        self.clip_qkv = None
 
         self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
@@ -1359,46 +1364,35 @@ class NeuronLlamaAttention(NeuronAttentionBase):
             f"Hello from NeuronLlamaAttention init! Is SP enabled? {self.sequence_parallel_enabled}. Dim? {self.sequence_dimension}"
         )
 
-        self.init_gqa_properties()
-
-        self.init_rope()
-
-    def init_rope(self):
-        if not hasattr(self.config, "rope_scaling") or self.config.rope_scaling is None:
-            # TODO(yihsian): Check if we can just use our own implementation
-            if self.is_medusa:
-                self.rotary_emb = LlamaRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=self.rope_theta,
-                )
+    def get_rope(self, config: InferenceConfig):
+        if not hasattr(config, "rope_scaling") or config.rope_scaling is None:
+            if config.neuron_config.is_medusa:
+                rotary_emb = LlamaRotaryEmbedding(config)
             else:
-                self.rotary_emb = RotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=self.rope_theta,
+                rotary_emb = RotaryEmbedding(
+                    getattr(config, "head_dim", config.hidden_size // config.num_attention_heads),
+                    max_position_embeddings=config.max_position_embeddings,
+                    base=config.rope_theta,
                 )
         else:
-            rope_type = self.config.rope_scaling.get(
-                "rope_type", self.config.rope_scaling.get("type", None)
+            rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type", None)
             )
             if rope_type == "llama3":
-                self.rotary_emb = Llama3RotaryEmbedding(
-                    dim=self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=self.rope_theta,
-                    factor=self.config.rope_scaling["factor"],
-                    low_freq_factor=self.config.rope_scaling["low_freq_factor"],
-                    high_freq_factor=self.config.rope_scaling["high_freq_factor"],
-                    original_max_position_embeddings=self.config.rope_scaling[
+                rotary_emb = Llama3RotaryEmbedding(
+                    dim=getattr(config, "head_dim", config.hidden_size // config.num_attention_heads),
+                    max_position_embeddings=config.max_position_embeddings,
+                    base=config.rope_theta,
+                    factor=config.rope_scaling["factor"],
+                    low_freq_factor=config.rope_scaling["low_freq_factor"],
+                    high_freq_factor=config.rope_scaling["high_freq_factor"],
+                    original_max_position_embeddings=config.rope_scaling[
                         "original_max_position_embeddings"
                     ],
                 )
             else:
-                # LlamaRotaryEmbedding automatically chooses the correct scaling type from config.
-                # Warning: The HF implementation may have precision issues when run on Neuron.
-                # We include it here for compatibility with other scaling types.
-                self.rotary_emb = LlamaRotaryEmbedding(self.config)
+                rotary_emb = LlamaRotaryEmbedding(config)
+        return rotary_emb
 
     def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask):
         """Override to use NKI flash attention kernel for context encoding.
