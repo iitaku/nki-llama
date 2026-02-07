@@ -4,6 +4,7 @@ import ast
 import base64
 import copy
 import json
+import glob
 import os
 import time
 import torch
@@ -408,6 +409,20 @@ def run_accuracy_check(
     return True
 
 
+def _find_hlo_file(base_dir):
+    """Find HLO file in a directory, supporting both old and new SDK formats."""
+    # Try old format first
+    old_path = os.path.join(base_dir, "model", "graph.hlo")
+    if os.path.exists(old_path):
+        return old_path
+    # Try new format: model.MODULE_*.hlo_module.pb
+    pattern = os.path.join(base_dir, "model.MODULE_*.hlo_module.pb")
+    matches = glob.glob(pattern)
+    if matches:
+        return matches[0]
+    raise FileNotFoundError(f"No HLO file found in {base_dir}")
+
+
 def count_nki_flop_ratio(
     hlo_path_context_enc="/tmp/nxd_model/context_encoding_model/_tp0_bk0/model/graph.hlo",
     hlo_path_token_gen="/tmp/nxd_model/token_generation_model/_tp0_bk0/model/graph.hlo"
@@ -477,6 +492,12 @@ def count_nki_flop_ratio(
                     hlo_mac += mac_count
 
         return hlo_mac, nki_mac
+
+    # Auto-detect HLO file paths if defaults don't exist
+    if not os.path.exists(hlo_path_context_enc):
+        hlo_path_context_enc = _find_hlo_file(os.path.dirname(hlo_path_context_enc))
+    if not os.path.exists(hlo_path_token_gen):
+        hlo_path_token_gen = _find_hlo_file(os.path.dirname(hlo_path_token_gen))
 
     hlo_proto_context_enc = parse_hlo_file(hlo_path_context_enc)
     hlo_proto_token_gen = parse_hlo_file(hlo_path_token_gen)
