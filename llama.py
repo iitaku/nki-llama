@@ -201,8 +201,9 @@ def nki_thin_gemm(lhsT, rhs):
             i_k_free_n = nl.arange(TILE_N_LOCAL)[None, :]
 
             # Load lhsT tile [128, M] - partition dim is K, free dim is M
+            i_m_free = nl.arange(M)[None, :]
             lhs_tile = nl.load(
-                lhsT[k_start + i_k, i_m.reshape((1, M))],
+                lhsT[k_start + i_k, i_m_free],
                 mask=(k_start + i_k < K)
             )
 
@@ -219,7 +220,7 @@ def nki_thin_gemm(lhsT, rhs):
         # Store result
         res_sbuf = nl.copy(res_psum, dtype=lhsT.dtype)
         nl.store(
-            result[i_m.reshape((M, 1)), n_start + i_n],
+            result[i_m, n_start + i_n],
             value=res_sbuf,
             mask=(n_start + i_n < N)
         )
@@ -396,7 +397,9 @@ def nki_fused_rmsnorm_thin_gemm(x, weightT, gamma, eps, residual=None):
             # Extract x_norm tile as [128, M] with K as partition
             # x_norm is currently [M, K] in SBUF, we need [K_tile, M]
             # Load from the normalized result
-            x_k_tile = nl.load(x_norm[i_m_free.reshape((M, 1)), k_start + i_kp.reshape((1, 128))])
+            i_m_idx = nl.arange(M)[:, None]
+            i_kp_idx = nl.arange(128)[None, :]
+            x_k_tile = nl.load(x_norm[i_m_idx, k_start + i_kp_idx])
             # Reshape to [128, M] for nc_matmul stationary
             # Actually we need to re-index: take K as partition dim
             # This requires a different approach since x_norm's partition dim is M
@@ -637,10 +640,12 @@ def flash_decode_kernel(q, k, v, mask):
 
     for b in nl.affine_range(batch):
         for h in nl.affine_range(heads):
-            # Load Q [head_dim, 1] -> transpose for computation
+            # Load Q [1, head_dim]: partition=1, free=head_dim
+            i_q1 = nl.arange(1)[:, None]
+            i_qd = nl.arange(head_dim)[None, :]
+            q_tile = nl.load(q[b, h, i_q1, i_qd])
+            # Index for K partition dim (head_dim)
             i_d = nl.arange(head_dim)[:, None]
-            i_1 = nl.arange(1)[None, :]
-            q_tile = nl.load(q[b, h, i_1.reshape((1, 1)), i_d.reshape((1, head_dim))])
             # q_tile is [1, head_dim]
 
             # Initialize accumulators
@@ -667,8 +672,9 @@ def flash_decode_kernel(q, k, v, mask):
                 qk = nl.multiply(qk, scale)
 
                 # Apply mask
+                i_m1 = nl.arange(1)[:, None]
                 mask_tile = nl.load(
-                    mask[b, 0, 0:1, k_start + i_kf],
+                    mask[b, 0, i_m1, k_start + i_kf],
                     mask=(k_start + i_kf < kv_len)
                 )
                 qk = nl.where(mask_tile > 0, qk, nl.full((1, PAR_LEN), -9984.0, dtype=nl.float32))
