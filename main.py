@@ -546,7 +546,17 @@ def main():
     args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
     
     llama = importlib.import_module(args.llama)
+
+    # Baseline model must NOT use on-device-sampling so it can return logits
+    # for accuracy check (output_scores=True requires CPU-side sampling)
+    ods_flag = args.on_device_sampling
+    args.on_device_sampling = False
+    base_compiled_path = args.compiled_model_path
+    if ods_flag:
+        args.compiled_model_path = args.compiled_model_path.rstrip('/') + '-base/'
     base_model, _, base_generation_config = prepare_inference(baseline_llama.NeuronLlamaForCausalLM, args)
+    args.on_device_sampling = ods_flag
+    args.compiled_model_path = base_compiled_path
     model, tokenizer, generation_config = prepare_inference(llama.NeuronLlamaForCausalLM, args)
 
     if args.mode == "generate":
