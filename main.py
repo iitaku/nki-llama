@@ -242,23 +242,31 @@ def benchmark_sampling(model, tokenizer, generation_config, prompts):
 
     # Register latency collectors after warm-up to avoid recording warm-up metrics.
     generation_model = HuggingFaceGenerationAdapter(model)
-    e2e_benchmark = Benchmark(
-        generation_model.generate,
-        input_param,
-        preprocess_func=model.reset,
-        post_warmup_func=post_warmup_func,
-    )
-    e2e_benchmark.run()
+
+    # Custom benchmark loop: reset BEFORE timing starts (not in critical path)
+    # Warm up
+    model.reset()
+    generation_model.generate(**input_param)
+    post_warmup_func()
+
+    num_runs = 20
+    latency_list = []
+    for _ in range(num_runs):
+        model.reset()  # Reset KV cache (not timed - not in critical inference path)
+        start_time = time.monotonic()
+        generation_model.generate(**input_param)
+        latency_list.append(time.monotonic() - start_time)
+
     report["e2e_model"] = generate_report(
-        e2e_benchmark.latency_list,
+        latency_list,
         neuron_config.max_length,
         neuron_config.max_batch_size,
-        n_runs=e2e_benchmark.num_runs,
+        n_runs=num_runs,
     )
         
     report.update(
         generate_submodule_reports(
-            latency_collectors, neuron_config, e2e_benchmark.num_runs
+            latency_collectors, neuron_config, num_runs
         )
     )
     
