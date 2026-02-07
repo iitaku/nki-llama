@@ -1427,54 +1427,52 @@ class NeuronLlamaMLP(nn.Module):
             self._down_w_T = self.down_proj.weight.permute(1, 0).contiguous()
 
     def _nki_mlp(self, x, rmsnorm, adapter_ids=None):
-        """NKI-powered MLP: uses ISA GEMM kernels for all projections."""
-        logger.debug("MLP: NKI ISA GEMM kernels")
+        """NKI-powered MLP: uses pre-built Neuron ISA kernel for fused MLP.
+
+        Uses mlp_isa_kernel which fuses gate+SiLU+up+multiply+down in one kernel,
+        eliminating HBM round-trips for intermediate activations.
+        """
+        logger.debug("MLP: NKI pre-built ISA kernel")
         if self.sequence_parallel_enabled:
             x = gather_from_sequence_parallel_region(
                 x, self.sequence_dimension, process_group=get_tp_group(self.config)
             )
 
-        original_shape = x.shape  # [B, S, K]
-        K = original_shape[-1]
-        x_2d = x.reshape(-1, K)  # [M, K]
-        M = x_2d.shape[0]
-
-        # Use cached transposed weights (computed once, reused every token)
+        # Use cached transposed weights [in, out] format expected by mlp_isa_kernel
         self._ensure_transposed_weights()
-        gate_w_T = self._gate_w_T  # [K, inter/tp]
-        up_w_T = self._up_w_T      # [K, inter/tp]
-        down_w_T = self._down_w_T  # [inter/tp, K_out]
 
-        x_T = x_2d.permute(1, 0).contiguous()  # [K, M]
+        # RMSNorm weight (needed by kernel even if fused_rmsnorm=False)
+        ln_w = rmsnorm.weight.unsqueeze(0) if rmsnorm is not None else torch.ones(
+            1, self.hidden_size, dtype=x.dtype, device=x.device)
 
-        if M <= 128:
-            gate_out, up_out = nki_fused_gate_up_gemm(x_T, gate_w_T, up_w_T)
-        else:
-            gate_out = nki_blocked_gemm(x_T, gate_w_T)
-            up_out = nki_blocked_gemm(x_T, up_w_T)
+        # Pre-allocate output tensor
+        output_tensor = torch.zeros(
+            size=x.shape,
+            dtype=x.dtype,
+            device=x.device,
+        )
 
-        down_proj_input = self.act_fn(gate_out) * up_out
-
-        swiglu_T = down_proj_input.permute(1, 0).contiguous()
-        if M <= 128:
-            output = nki_thin_gemm(swiglu_T, down_w_T)
-        else:
-            output = nki_blocked_gemm(swiglu_T, down_w_T)
-
-        output = output.reshape(original_shape[:-1] + (output.shape[-1],))
+        # Use pre-built Neuron MLP ISA kernel (fused gate+SiLU+up+mul+down)
+        _mlp_fwd_call = nki_jit()(mlp_isa_kernel)
+        _mlp_fwd_call(
+            x, ln_w, self._gate_w_T, self._up_w_T, self._down_w_T, output_tensor,
+            fused_rmsnorm=False,  # RMSNorm already applied by decoder layer
+            eps=self.rms_norm_eps,
+            kernel_name="MLP",
+        )
 
         # TP reduction
         if self.sequence_parallel_enabled:
-            output = reduce_scatter_to_sequence_parallel_region(
-                output, self.sequence_dimension, process_group=get_tp_group(self.config)
+            output_tensor = reduce_scatter_to_sequence_parallel_region(
+                output_tensor, self.sequence_dimension, process_group=get_tp_group(self.config)
             )
         else:
-            output = reduce_from_tensor_model_parallel_region(
-                output, process_group=get_tp_group(self.config)
+            output_tensor = reduce_from_tensor_model_parallel_region(
+                output_tensor, process_group=get_tp_group(self.config)
             )
 
-        logger.debug(f"NKI MLP output shape {output.shape}")
-        return output
+        logger.debug(f"NKI MLP output shape {output_tensor.shape}")
+        return output_tensor
 
     def forward(self, x, rmsnorm=None, residual=None, adapter_ids=None):
         """
