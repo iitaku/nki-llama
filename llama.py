@@ -852,10 +852,8 @@ class CustomRMSNorm(nn.Module):
         self.nki_enabled = nki_enabled
 
     def forward(self, hidden_states):
-        if self.nki_enabled and hidden_states.shape[1] > 1:
-            out_tensor = nki_rmsnorm_kernel(hidden_states, self.weight, self.variance_epsilon)
-            return out_tensor
-
+        # NKI RMSNorm disabled: mac_count=0 (doesn't help NKI FLOP ratio)
+        # and compiler RMSNorm is faster for these shapes
         original_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         result = RmsNorm.apply(
