@@ -310,6 +310,30 @@ def check_accuracy_logits(base_model, base_generation_config, neuron_model, toke
     print("Expected Output: ", expected_tokens, expected_token_ids)
     print("Expected Logits Shape: ", expected_logits.shape)
 
+    # On-device sampling models can't return per-step logits,
+    # so compare generated token sequences directly
+    if neuron_model.on_device_sampling:
+        ods_model = HuggingFaceGenerationAdapter(neuron_model)
+        with torch.inference_mode():
+            ods_outputs = ods_model.generate(
+                input_ids=initial_input_ids,
+                attention_mask=initial_attention_mask,
+                max_new_tokens=new_tokens,
+                min_new_tokens=new_tokens,
+                do_sample=False,
+                return_dict_in_generate=True,
+                generation_config=generation_config,
+            )
+        actual_token_ids = ods_outputs.sequences[:, initial_input_ids.shape[1]:]
+        actual_tokens = tokenizer.batch_decode(
+            actual_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        print("Actual Output (ODS): ", actual_tokens, actual_token_ids)
+        match = (actual_token_ids == expected_token_ids).all()
+        assert match, f"Token mismatch in ODS mode"
+        print("Passed token validation (ODS mode)")
+        return
+
     model = HuggingFaceGenerationAdapter(neuron_model)
     expected_attention_mask = torch.ones(
         (
