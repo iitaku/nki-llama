@@ -1372,16 +1372,15 @@ class NeuronLlamaMLP(nn.Module):
 
         if M <= 128:
             gate_out, up_out = nki_fused_gate_up_gemm(x_T, gate_w_T, up_w_T)
+            # Fused SwiGLU + down projection: eliminates HBM roundtrip
+            gate_out_T = gate_out.permute(1, 0).contiguous()
+            up_out_T = up_out.permute(1, 0).contiguous()
+            output = nki_fused_swiglu_down(gate_out_T, up_out_T, down_w_T)
         else:
             gate_out = nki_blocked_gemm(x_T, gate_w_T)
             up_out = nki_blocked_gemm(x_T, up_w_T)
-
-        down_proj_input = self.act_fn(gate_out) * up_out
-
-        swiglu_T = down_proj_input.permute(1, 0).contiguous()
-        if M <= 128:
-            output = nki_thin_gemm(swiglu_T, down_w_T)
-        else:
+            down_proj_input = self.act_fn(gate_out) * up_out
+            swiglu_T = down_proj_input.permute(1, 0).contiguous()
             output = nki_blocked_gemm(swiglu_T, down_w_T)
 
         output = output.reshape(original_shape[:-1] + (output.shape[-1],))
