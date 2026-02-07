@@ -865,11 +865,11 @@ class NeuronLlamaMLP(nn.Module):
         )
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
         self.rms_norm_eps = config.rms_norm_eps
-        self.mlp_kernel_enabled = self.neuron_config.mlp_kernel_enabled
-        self.quantized_mlp_kernel_enabled = self.neuron_config.quantized_mlp_kernel_enabled
-        self.rmsnorm_quantize_kernel_enabled = self.neuron_config.rmsnorm_quantize_kernel_enabled
-        self.quantized_kernel_lower_bound = self.neuron_config.quantized_kernel_lower_bound
-        self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
+        self.mlp_kernel_enabled = getattr(self.neuron_config, "mlp_kernel_enabled", False)
+        self.quantized_mlp_kernel_enabled = getattr(self.neuron_config, "quantized_mlp_kernel_enabled", False)
+        self.rmsnorm_quantize_kernel_enabled = getattr(self.neuron_config, "rmsnorm_quantize_kernel_enabled", False)
+        self.quantized_kernel_lower_bound = getattr(self.neuron_config, "quantized_kernel_lower_bound", 0)
+        self.logical_neuron_cores = getattr(self.neuron_config, "logical_neuron_cores", None)
         mlp_bias = getattr(config, "mlp_bias", False)
         if parallel_state.model_parallel_is_initialized():
             if self.quantized_mlp_kernel_enabled:
@@ -1348,8 +1348,8 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         self.is_medusa = config.neuron_config.is_medusa
         self.flash_decoding_enabled = config.neuron_config.flash_decoding_enabled
         self.bias = getattr(config, "attention_bias", False)
-        self.rpl_reduce_dtype = config.neuron_config.rpl_reduce_dtype
-        self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
+        self.rpl_reduce_dtype = getattr(config.neuron_config, "rpl_reduce_dtype", None)
+        self.mlp_kernel_enabled = getattr(config.neuron_config, "mlp_kernel_enabled", False)
 
         if parallel_state.model_parallel_is_initialized():
             self.tp_degree = self.config.neuron_config.tp_degree
@@ -1604,18 +1604,18 @@ class NeuronLlamaDecoderLayer(nn.Module):
             self.input_layernorm = get_rmsnorm_cls()(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
-                nki_enabled=config.neuron_config.nki_enabled,
+                nki_enabled=getattr(config.neuron_config, "nki_enabled", False),
             )
         self.post_attention_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            nki_enabled=config.neuron_config.nki_enabled,
+            nki_enabled=getattr(config.neuron_config, "nki_enabled", False),
         )
-        self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
-        self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
-        self.rmsnorm_quantize_kernel_enabled = config.neuron_config.rmsnorm_quantize_kernel_enabled
-        self.mlp_kernel_fuse_residual_add = config.neuron_config.mlp_kernel_fuse_residual_add
-        self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
+        self.qkv_kernel_enabled = getattr(config.neuron_config, "qkv_kernel_enabled", False)
+        self.mlp_kernel_enabled = getattr(config.neuron_config, "mlp_kernel_enabled", False)
+        self.rmsnorm_quantize_kernel_enabled = getattr(config.neuron_config, "rmsnorm_quantize_kernel_enabled", False)
+        self.mlp_kernel_fuse_residual_add = getattr(config.neuron_config, "mlp_kernel_fuse_residual_add", False)
+        self.sequence_parallel_enabled = getattr(config.neuron_config, "sequence_parallel_enabled", False)
         self.config = config
 
     def forward(
@@ -1764,22 +1764,23 @@ class NeuronLlamaModel(NeuronBaseModel):
             # TODO: Remove hardcoded code to have non-quantized MLPs for first and last decoder block
             if i == 0 or i == config.num_hidden_layers - 1:
                 non_quant_config = copy.deepcopy(config)
-                non_quant_config.neuron_config.quantized_mlp_kernel_enabled = False
+                if hasattr(non_quant_config.neuron_config, "quantized_mlp_kernel_enabled"):
+                    non_quant_config.neuron_config.quantized_mlp_kernel_enabled = False
                 updated_configs.append(non_quant_config)
             else:
                 updated_configs.append(config)
         self.layers = nn.ModuleList([NeuronLlamaDecoderLayer(conf) for conf in updated_configs])
         if not config.neuron_config.is_eagle_draft:
-            self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps, nki_enabled=config.neuron_config.nki_enabled)
+            self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps, nki_enabled=getattr(config.neuron_config, "nki_enabled", False))
 
         if config.neuron_config.is_eagle_draft:
             fc_bias = getattr(config, "fc_bias", False)
             self.fc = ColumnParallelLinear(
                 config.hidden_size * 2, config.hidden_size, bias=fc_bias, gather_output=True
             )
-        self.is_medusa = config.neuron_config.is_medusa
-        self.num_medusa_heads = config.neuron_config.num_medusa_heads
-        self.medusa_speculation_length = config.neuron_config.medusa_speculation_length
+        self.is_medusa = getattr(config.neuron_config, "is_medusa", False)
+        self.num_medusa_heads = getattr(config.neuron_config, "num_medusa_heads", 0)
+        self.medusa_speculation_length = getattr(config.neuron_config, "medusa_speculation_length", 0)
 
         if self.is_medusa:
             if parallel_state.model_parallel_is_initialized():
