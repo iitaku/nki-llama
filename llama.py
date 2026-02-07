@@ -1478,9 +1478,10 @@ class NeuronLlamaAttention(NeuronAttentionBase):
             f"Hello from NeuronLlamaAttention init! Is SP enabled? {self.sequence_parallel_enabled}. Dim? {self.sequence_dimension}"
         )
 
-        # Patch QKV projections to use NKI GEMM for context encoding
+        # Patch attention projections to use NKI GEMM for context encoding
         if getattr(config.neuron_config, 'nki_enabled', False):
             self._patch_qkv_nki_gemm()
+            self._patch_o_proj_nki_gemm(config)
 
     def _patch_qkv_nki_gemm(self):
         """Replace QKV projection matmuls with NKI GEMM for M > 1 (context encoding).
@@ -1552,6 +1553,56 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 return Q, K_out, V_out
 
             qkv._native_qkv_forward = nki_separate_qkv_forward
+
+    def _patch_o_proj_nki_gemm(self, config):
+        """Replace O projection matmul with NKI GEMM for M > 1 (context encoding).
+        Handles all-reduce manually after NKI GEMM."""
+        o_proj_wrapper = getattr(self, 'o_proj', None)
+        if o_proj_wrapper is None:
+            return
+
+        # Access the RowParallelLinear inside GroupQueryAttention_O
+        rpl = getattr(o_proj_wrapper, 'o_proj', None)
+        if rpl is None:
+            return
+
+        original_o_forward = o_proj_wrapper.forward
+        _cache = {}
+        sp_enabled = getattr(o_proj_wrapper, 'sequence_parallel_enabled', False)
+
+        def nki_o_proj_forward(attention_output, adapter_ids=None):
+            M = attention_output.reshape(-1, attention_output.shape[-1]).shape[0]
+            if not NKI_ENABLED or M <= 1:
+                return original_o_forward(attention_output, adapter_ids)
+
+            if 'o_wT' not in _cache:
+                _cache['o_wT'] = rpl.weight.permute(1, 0).contiguous()
+
+            original_shape = attention_output.shape
+            K_dim = original_shape[-1]
+            x_2d = attention_output.reshape(-1, K_dim)
+            x_T = x_2d.permute(1, 0).contiguous()
+
+            if M <= 128:
+                output = nki_thin_gemm(x_T, _cache['o_wT'])
+            else:
+                output = nki_blocked_gemm(x_T, _cache['o_wT'])
+
+            output = output.reshape(original_shape[:-1] + (output.shape[-1],))
+
+            # TP reduction (same as RowParallelLinear behavior)
+            if sp_enabled:
+                output = reduce_scatter_to_sequence_parallel_region(
+                    output, 1, process_group=get_tp_group(config)
+                )
+            else:
+                output = reduce_from_tensor_model_parallel_region(
+                    output, process_group=get_tp_group(config)
+                )
+
+            return output
+
+        o_proj_wrapper.forward = nki_o_proj_forward
 
     def get_rope(self, config: InferenceConfig):
         if not hasattr(config, "rope_scaling") or config.rope_scaling is None:
