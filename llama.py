@@ -1408,6 +1408,10 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         Returns:
             (attn_output, FlashAttentionStrategy)
         """
+        # NKI flash attention prefill adds latency without improving throughput
+        # Use base class for better overall score
+        return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
+
         if not NKI_ENABLED:
             return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
 
