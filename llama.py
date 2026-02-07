@@ -1350,6 +1350,8 @@ class NeuronLlamaMLP(nn.Module):
             self._gate_w_T = self.gate_proj.weight.permute(1, 0).contiguous()
             self._up_w_T = self.up_proj.weight.permute(1, 0).contiguous()
             self._down_w_T = self.down_proj.weight.permute(1, 0).contiguous()
+            # Fused gate+up weight: [K, 2*N] - single GEMM instead of two
+            self._gate_up_w_T = torch.cat([self._gate_w_T, self._up_w_T], dim=1).contiguous()
 
     def _nki_mlp(self, x, rmsnorm, adapter_ids=None):
         """NKI-powered MLP: uses ISA GEMM kernels for all projections."""
@@ -1366,18 +1368,19 @@ class NeuronLlamaMLP(nn.Module):
 
         # Use cached transposed weights (computed once, reused every token)
         self._ensure_transposed_weights()
-        gate_w_T = self._gate_w_T  # [K, inter/tp]
-        up_w_T = self._up_w_T      # [K, inter/tp]
+        gate_up_w_T = self._gate_up_w_T  # [K, 2*inter/tp] - fused gate+up
+        N_half = self._gate_w_T.shape[1]  # inter/tp
         down_w_T = self._down_w_T  # [inter/tp, K_out]
 
         x_T = x_2d.permute(1, 0).contiguous()  # [K, M]
 
+        # Fused gate+up: single GEMM with concatenated weights
         if M <= 128:
-            gate_out = nki_thin_gemm(x_T, gate_w_T)
-            up_out = nki_thin_gemm(x_T, up_w_T)
+            gate_up_out = nki_thin_gemm(x_T, gate_up_w_T)  # [M, 2*N]
         else:
-            gate_out = nki_blocked_gemm(x_T, gate_w_T)
-            up_out = nki_blocked_gemm(x_T, up_w_T)
+            gate_up_out = nki_blocked_gemm(x_T, gate_up_w_T)
+        gate_out = gate_up_out[:, :N_half]
+        up_out = gate_up_out[:, N_half:]
 
         down_proj_input = self.act_fn(gate_out) * up_out
 
@@ -1526,6 +1529,9 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         Returns:
             (attn_output, FlashAttentionStrategy)
         """
+        # Flash attention prefill adds ~2ms latency, NKI FLOP gain (+0.007) not worth it
+        return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
+
         if not NKI_ENABLED:
             return super().perform_prefill(Q, K, V, q_len, bsz, attention_mask)
 
