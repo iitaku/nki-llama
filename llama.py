@@ -852,11 +852,8 @@ class CustomRMSNorm(nn.Module):
         self.nki_enabled = nki_enabled
 
     def forward(self, hidden_states):
-        if self.nki_enabled and hidden_states.shape[1] > 1:
-            # Use NKI RMSNorm for context encoding (S>1), compiler for token gen (S=1)
-            out_tensor = nki_rmsnorm_kernel(hidden_states, self.weight, self.variance_epsilon)
-            return out_tensor
-
+        # Always use compiler RMSNorm - NKI RMSNorm has mac_count=0 (no NKI FLOP contribution)
+        # and compiler RMSNorm is faster (no kernel dispatch overhead, can fuse with surrounding ops)
         original_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         result = RmsNorm.apply(
@@ -1372,15 +1369,16 @@ class NeuronLlamaMLP(nn.Module):
 
         if M <= 128:
             gate_out, up_out = nki_fused_gate_up_gemm(x_T, gate_w_T, up_w_T)
-            # Fused SwiGLU + down projection: eliminates HBM roundtrip
-            gate_out_T = gate_out.permute(1, 0).contiguous()
-            up_out_T = up_out.permute(1, 0).contiguous()
-            output = nki_fused_swiglu_down(gate_out_T, up_out_T, down_w_T)
         else:
             gate_out = nki_blocked_gemm(x_T, gate_w_T)
             up_out = nki_blocked_gemm(x_T, up_w_T)
-            down_proj_input = self.act_fn(gate_out) * up_out
-            swiglu_T = down_proj_input.permute(1, 0).contiguous()
+
+        down_proj_input = self.act_fn(gate_out) * up_out
+
+        swiglu_T = down_proj_input.permute(1, 0).contiguous()
+        if M <= 128:
+            output = nki_thin_gemm(swiglu_T, down_w_T)
+        else:
             output = nki_blocked_gemm(swiglu_T, down_w_T)
 
         output = output.reshape(original_shape[:-1] + (output.shape[-1],))
