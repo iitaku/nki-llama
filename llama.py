@@ -203,7 +203,7 @@ def nki_thin_gemm(lhsT, rhs):
             )
 
             # ISA matmul: stationary^T @ moving, accumulates in psum
-            nisa.nc_matmul(res_psum, lhs_tile, rhs_tile)
+            res_psum += nisa.nc_matmul(lhs_tile, rhs_tile)
 
         res_sbuf = nl.copy(res_psum, dtype=lhsT.dtype)
         nl.store(
@@ -254,7 +254,7 @@ def nki_blocked_gemm(lhsT, rhs):
                     mask=((k_start + i_k < K) & (n_start + i_n < N))
                 )
 
-                nisa.nc_matmul(res_psum, lhs_tile, rhs_tile)
+                res_psum += nisa.nc_matmul(lhs_tile, rhs_tile)
 
             res_sbuf = nl.copy(res_psum, dtype=lhsT.dtype)
             nl.store(
@@ -322,8 +322,8 @@ def nki_fused_gate_up_gemm(lhsT, gate_rhs, up_rhs):
             )
 
             # Two matmuls sharing same stationary (activation) tile
-            nisa.nc_matmul(gate_psum, lhs_tile, gate_tile)
-            nisa.nc_matmul(up_psum, lhs_tile, up_tile)
+            gate_psum += nisa.nc_matmul(lhs_tile, gate_tile)
+            up_psum += nisa.nc_matmul(lhs_tile, up_tile)
 
         gate_sbuf = nl.copy(gate_psum, dtype=lhsT.dtype)
         up_sbuf = nl.copy(up_psum, dtype=lhsT.dtype)
@@ -405,7 +405,7 @@ def nki_fused_swiglu_down(gate_T, up_T, down_rhs):
             )
 
             # ISA matmul: swiglu^T @ down = [M, TILE_K]
-            nisa.nc_matmul(res_psum, swiglu_tile, down_tile)
+            res_psum += nisa.nc_matmul(swiglu_tile, down_tile)
 
         res_sbuf = nl.copy(res_psum, dtype=gate_T.dtype)
         nl.store(
