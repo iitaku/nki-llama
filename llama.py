@@ -1089,7 +1089,7 @@ class NeuronLlamaMLP(nn.Module):
             self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=mlp_bias)
 
     def _kernel_enabled_quantized_mlp(self, x, fused_rmsnorm, rmsnorm, residual, adapter_ids):
-        grid = (vnc(self.logical_neuron_cores),)
+        grid = (vnc(self.logical_neuron_cores),) if vnc is not None else None
         fused_residual = residual is not None
         logger.debug(
             f"MLP: quantized kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_neuron_cores={self.logical_neuron_cores}"
@@ -1270,39 +1270,37 @@ class NeuronLlamaMLP(nn.Module):
         up_w = self.up_proj.weight.data
         down_w = self.down_proj.weight.data
 
-        grid = (vnc(self.logical_neuron_cores),)
+        if vnc is not None:
+            grid = (vnc(self.logical_neuron_cores),)
+        else:
+            grid = None
 
         if fused_residual:
-            _mlp_fwd_call[grid](
-                x,  # attn_output
-                residual,  # hidden
-                ln_w,  # ln_w
-                gate_w,  # gate_w
-                up_w,  # up_w
-                down_w,  # down_w
-                output_tensor,  # out
+            kernel_kwargs = dict(
                 fused_rmsnorm=fused_rmsnorm,
                 eps=self.rms_norm_eps,
                 kernel_name="MLP",
                 store_add=True,
             )
+            kernel_args = (x, residual, ln_w, gate_w, up_w, down_w, output_tensor)
+            if grid is not None:
+                _mlp_fwd_call[grid](*kernel_args, **kernel_kwargs)
+            else:
+                _mlp_fwd_call(*kernel_args, **kernel_kwargs)
             original_seqlen = x.shape[1]
             residual = output_tensor[:, original_seqlen:, :]
             output_tensor = output_tensor[:, :original_seqlen, :]
         else:
-            _mlp_fwd_call[grid](
-                x,  # hidden
-                # should be fine to pass gamma is as a dummy even if not using fused rmsnorm
-                ln_w,
-                gate_w,
-                up_w,
-                down_w,
-                output_tensor,  # out
-                # Run RMSNorm inside the kernel if NOT using SP rmsnorm
+            kernel_kwargs = dict(
                 fused_rmsnorm=fused_rmsnorm,
                 eps=self.rms_norm_eps,
                 kernel_name="MLP",
             )
+            kernel_args = (x, ln_w, gate_w, up_w, down_w, output_tensor)
+            if grid is not None:
+                _mlp_fwd_call[grid](*kernel_args, **kernel_kwargs)
+            else:
+                _mlp_fwd_call(*kernel_args, **kernel_kwargs)
             residual = None
 
         # All-reduce or reduce-scatter, depending on whether SP is enabled
@@ -1373,8 +1371,7 @@ class NeuronLlamaMLP(nn.Module):
         x_T = x_2d.permute(1, 0).contiguous()  # [K, M]
 
         if M <= 128:
-            gate_out = nki_thin_gemm(x_T, gate_w_T)
-            up_out = nki_thin_gemm(x_T, up_w_T)
+            gate_out, up_out = nki_fused_gate_up_gemm(x_T, gate_w_T, up_w_T)
         else:
             gate_out = nki_blocked_gemm(x_T, gate_w_T)
             up_out = nki_blocked_gemm(x_T, up_w_T)
