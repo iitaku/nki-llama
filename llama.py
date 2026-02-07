@@ -1492,11 +1492,9 @@ class NeuronLlamaMLP(nn.Module):
                 x, fused_rmsnorm, rmsnorm, residual, adapter_ids=adapter_ids
             )
         elif NKI_ENABLED:
-            # Use compiler matmul for M=1 (token gen) - faster than NKI for tiny M
-            # NKI GEMM for M>1 (context encoding) - more NKI FLOPs
-            M = x.reshape(-1, x.shape[-1]).shape[0]
-            if M <= 1:
-                return (self._native_mlp(x, rmsnorm, adapter_ids=adapter_ids), None)
+            # Always use pre-built ISA kernel (fuses gate+SiLU+up+mul+down)
+            # For M=1 (TG), fusion saves 4 kernel dispatches + HBM round-trips
+            # Also increases NKI FLOP ratio for scoring
             return (self._nki_mlp(x, rmsnorm, adapter_ids=adapter_ids), None)
         else:
             # No kernel
@@ -1573,7 +1571,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
 
             def nki_fused_qkv_forward(hidden_states, adapter_ids=None):
                 M = hidden_states.reshape(-1, hidden_states.shape[-1]).shape[0]
-                if not NKI_ENABLED or M <= 1:
+                if not NKI_ENABLED:
                     return original_native(hidden_states, adapter_ids)
 
                 if 'wqkv_T' not in _cache:
@@ -1600,7 +1598,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
 
             def nki_separate_qkv_forward(hidden_states, adapter_ids=None):
                 M = hidden_states.reshape(-1, hidden_states.shape[-1]).shape[0]
-                if not NKI_ENABLED or M <= 1:
+                if not NKI_ENABLED:
                     return original_native(hidden_states, adapter_ids)
 
                 if 'q_wT' not in _cache:
@@ -1648,7 +1646,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
 
         def nki_o_proj_forward(attention_output, adapter_ids=None):
             M = attention_output.reshape(-1, attention_output.shape[-1]).shape[0]
-            if not NKI_ENABLED or M <= 1:
+            if not NKI_ENABLED:
                 return original_o_forward(attention_output, adapter_ids)
 
             if 'o_wT' not in _cache:
