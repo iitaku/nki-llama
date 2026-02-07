@@ -1478,6 +1478,81 @@ class NeuronLlamaAttention(NeuronAttentionBase):
             f"Hello from NeuronLlamaAttention init! Is SP enabled? {self.sequence_parallel_enabled}. Dim? {self.sequence_dimension}"
         )
 
+        # Patch QKV projections to use NKI GEMM for context encoding
+        if getattr(config.neuron_config, 'nki_enabled', False):
+            self._patch_qkv_nki_gemm()
+
+    def _patch_qkv_nki_gemm(self):
+        """Replace QKV projection matmuls with NKI GEMM for M > 1 (context encoding).
+        For M <= 1 (token generation), falls back to compiler matmul."""
+        qkv = getattr(self, 'qkv_proj', None)
+        if qkv is None:
+            return
+
+        if self.fused_qkv:
+            # Fused QKV: single Wqkv weight
+            original_native = qkv._native_qkv_forward
+            _cache = {}
+
+            def nki_fused_qkv_forward(hidden_states, adapter_ids=None):
+                M = hidden_states.reshape(-1, hidden_states.shape[-1]).shape[0]
+                if not NKI_ENABLED or M <= 1:
+                    return original_native(hidden_states, adapter_ids)
+
+                if 'wqkv_T' not in _cache:
+                    _cache['wqkv_T'] = qkv.Wqkv.weight.permute(1, 0).contiguous()
+
+                original_shape = hidden_states.shape
+                K_dim = original_shape[-1]
+                x_2d = hidden_states.reshape(-1, K_dim)
+                x_T = x_2d.permute(1, 0).contiguous()
+
+                if M <= 128:
+                    QKV = nki_thin_gemm(x_T, _cache['wqkv_T'])
+                else:
+                    QKV = nki_blocked_gemm(x_T, _cache['wqkv_T'])
+
+                QKV = QKV.reshape(original_shape[:-1] + (QKV.shape[-1],))
+                return qkv._split_fused_qkv(QKV)
+
+            qkv._native_qkv_forward = nki_fused_qkv_forward
+        else:
+            # Separate Q, K, V projections
+            original_native = qkv._native_qkv_forward
+            _cache = {}
+
+            def nki_separate_qkv_forward(hidden_states, adapter_ids=None):
+                M = hidden_states.reshape(-1, hidden_states.shape[-1]).shape[0]
+                if not NKI_ENABLED or M <= 1:
+                    return original_native(hidden_states, adapter_ids)
+
+                if 'q_wT' not in _cache:
+                    _cache['q_wT'] = qkv.q_proj.weight.permute(1, 0).contiguous()
+                    _cache['k_wT'] = qkv.k_proj.weight.permute(1, 0).contiguous()
+                    _cache['v_wT'] = qkv.v_proj.weight.permute(1, 0).contiguous()
+
+                original_shape = hidden_states.shape
+                K_dim = original_shape[-1]
+                x_2d = hidden_states.reshape(-1, K_dim)
+                x_T = x_2d.permute(1, 0).contiguous()
+
+                if M <= 128:
+                    Q = nki_thin_gemm(x_T, _cache['q_wT'])
+                    K_out = nki_thin_gemm(x_T, _cache['k_wT'])
+                    V_out = nki_thin_gemm(x_T, _cache['v_wT'])
+                else:
+                    Q = nki_blocked_gemm(x_T, _cache['q_wT'])
+                    K_out = nki_blocked_gemm(x_T, _cache['k_wT'])
+                    V_out = nki_blocked_gemm(x_T, _cache['v_wT'])
+
+                Q = Q.reshape(original_shape[:-1] + (Q.shape[-1],))
+                K_out = K_out.reshape(original_shape[:-1] + (K_out.shape[-1],))
+                V_out = V_out.reshape(original_shape[:-1] + (V_out.shape[-1],))
+
+                return Q, K_out, V_out
+
+            qkv._native_qkv_forward = nki_separate_qkv_forward
+
     def get_rope(self, config: InferenceConfig):
         if not hasattr(config, "rope_scaling") or config.rope_scaling is None:
             if config.neuron_config.is_medusa:
